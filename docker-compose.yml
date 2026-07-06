@@ -1,0 +1,15 @@
+services:
+  plustainer:
+    build: .
+    container_name: plustainer
+    restart: unless-stopped
+    ports:
+      - "3456:3456"
+    environment:
+      - PORTAINER_URL=https://MyPortainer.URL
+      - PORTAINER_API_KEY=MyAPIToken
+      - PORTAINER_ENDPOINT_ID=MyPortainerInstance
+      - PORT=3456
+      - SERVER_LOCAL_IP=MyLocalIP
+    volumes:
+      - ./data:/app/data
