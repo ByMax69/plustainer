@@ -99,6 +99,7 @@ fn app() -> Html {
     // Create / rename group modals
     let show_create_group = use_state(|| false);
     let rename_group      = use_state(|| None::<FavoriteGroup>);
+    let confirm_delete_group = use_state(|| None::<FavoriteGroup>);
     let dragged_stack    = use_state(|| None::<String>);
     let drag_over_stack  = use_state(|| None::<String>);
 
@@ -362,6 +363,34 @@ fn app() -> Html {
         }
     } else { html! {} };
 
+    // Pre-compute delete group confirmation modal
+    let confirm_delete_group_frag: Html = if let Some(g) = (*confirm_delete_group).clone() {
+        let cdg_close = confirm_delete_group.clone();
+        let fgs = favorite_groups.clone();
+        let co  = custom_order.clone();
+        let so  = sort_order.clone();
+        let af  = active_filter.clone();
+        let gid = g.id.clone();
+        html! {
+            <ConfirmModal
+                title={ "Supprimer le groupe".to_string() }
+                message={ format!("Voulez-vous vraiment supprimer le groupe « {} » ?", g.name) }
+                on_close={ Callback::from(move |_: ()| cdg_close.set(None)) }
+                on_confirm={
+                    let cdg = confirm_delete_group.clone();
+                    Callback::from(move |_: ()| {
+                        let mut groups = (*fgs).clone();
+                        groups.retain(|x| x.id != gid);
+                        fgs.set(groups.clone());
+                        if af.as_deref() == Some(&gid) { af.set(None); }
+                        save_to_backend(groups, (*co).clone(), (*so).clone());
+                        cdg.set(None);
+                    })
+                }
+            />
+        }
+    } else { html! {} };
+
     html! {
         <>
             // ── Header ────────────────────────────────────────────────────────
@@ -398,16 +427,13 @@ fn app() -> Html {
                 {
                     (*favorite_groups).iter().map(|g| {
                         let gid = g.id.clone();
-                        let gid_del = g.id.clone();
                         let gid_active = g.id.clone();
                         let is_active = active_filter.as_deref() == Some(&gid_active);
                         let count = g.stacks.len();
                         let g_for_rename = g.clone();
 
-                        let fgs_del = favorite_groups.clone();
-                        let co_del  = custom_order.clone();
-                        let so_del  = sort_order.clone();
-                        let af_del  = active_filter.clone();
+                        let g_for_delete = g.clone();
+                        let cdg = confirm_delete_group.clone();
 
                         html! {
                             <div class={if is_active { "group-pill group-pill--active" } else { "group-pill" }}>
@@ -434,11 +460,7 @@ fn app() -> Html {
                                         onclick={
                                             Callback::from(move |e: MouseEvent| {
                                                 e.stop_propagation();
-                                                let mut gs = (*fgs_del).clone();
-                                                gs.retain(|x| x.id != gid_del);
-                                                fgs_del.set(gs.clone());
-                                                if af_del.as_deref() == Some(&gid_del) { af_del.set(None); }
-                                                save_to_backend(gs, (*co_del).clone(), (*so_del).clone());
+                                                cdg.set(Some(g_for_delete.clone()));
                                             })
                                         }
                                     >{ "×" }</button>
@@ -696,6 +718,9 @@ fn app() -> Html {
 
             // ── Rename group modal (pre-computed above) ───────────────────────
             { rename_group_frag }
+
+            // ── Delete group confirmation modal (pre-computed above) ──────────
+            { confirm_delete_group_frag }
         </>
     }
 }
@@ -778,6 +803,33 @@ fn group_name_modal(props: &GroupNameProps) -> Html {
                         let name = name.clone();
                         Callback::from(move |_| cb.emit((*name).clone()))
                     }>{ "Enregistrer" }</button>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+// ── Confirmation modal (used for destructive actions like delete) ──────────────
+#[derive(Properties, PartialEq)]
+pub struct ConfirmProps {
+    pub title: String,
+    pub message: String,
+    pub on_close: Callback<()>,
+    pub on_confirm: Callback<()>,
+}
+
+#[function_component(ConfirmModal)]
+fn confirm_modal(props: &ConfirmProps) -> Html {
+    let on_close = props.on_close.clone();
+    let on_confirm = props.on_confirm.clone();
+    html! {
+        <div class="modal-overlay">
+            <div class="modal" style="width:360px;">
+                <h3>{ &props.title }</h3>
+                <p style="margin-top:1rem;color:rgba(255,255,255,0.8);">{ &props.message }</p>
+                <div style="display:flex;gap:1rem;margin-top:1.5rem;">
+                    <button class="btn" style="background:#333;" onclick={move |_| on_close.emit(())}>{ "Annuler" }</button>
+                    <button class="btn btn-danger" onclick={move |_| on_confirm.emit(())}>{ "Supprimer" }</button>
                 </div>
             </div>
         </div>
