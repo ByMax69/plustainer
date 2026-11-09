@@ -1,10 +1,39 @@
 <!DOCTYPE html>
-<html>
+<html lang="fr">
 <head>
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Plustainer</title>
+    <meta name="description" content="Tableau de bord rapide et adapté aux smartphones pour gérer vos stacks et conteneurs Portainer" />
+    <meta name="theme-color" content="#06060c" />
+
+    <!-- PWA & Mobile Web App (iOS / Android / Chrome Desktop) -->
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Plustainer" />
+    <meta name="application-name" content="Plustainer" />
+
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+
+    <!-- Trunk assets -->
     <link data-trunk rel="css" href="style.css" />
+    <link data-trunk rel="copy-file" href="manifest.json" />
+    <link data-trunk rel="copy-file" href="sw.js" />
+    <link data-trunk rel="copy-file" href="icon.svg" />
+    <link data-trunk rel="copy-file" href="icon-192.png" />
+    <link data-trunk rel="copy-file" href="icon-512.png" />
+    <link data-trunk rel="copy-file" href="apple-touch-icon.png" />
 </head>
 <body>
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/sw.js').catch(() => {});
+            });
+        }
+    </script>
 </body>
 </html>

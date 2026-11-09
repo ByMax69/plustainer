@@ -1,5 +1,6 @@
 use gloo_net::http::Request;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use yew::prelude::*;
 
 #[derive(Clone, PartialEq, Deserialize, Serialize)]
@@ -22,7 +23,7 @@ pub struct Container {
     #[serde(rename = "Id")]     pub id: String,
     #[serde(rename = "Names")]  pub names: Vec<String>,
     #[serde(rename = "State")]  pub state: String,
-    #[serde(rename = "Labels")] pub labels: Option<std::collections::HashMap<String, String>>,
+    #[serde(rename = "Labels")] pub labels: Option<HashMap<String, String>>,
     #[serde(rename = "Ports")]  pub ports: Option<Vec<PortInfo>>,
 }
 
@@ -50,10 +51,17 @@ pub struct AppSettings {
 }
 
 #[derive(Clone, PartialEq)]
+pub enum NotificationKind {
+    Loading,
+    Success,
+    Error,
+}
+
+#[derive(Clone, PartialEq)]
 pub struct Notification {
     pub id: u32,
     pub message: String,
-    pub success: bool,
+    pub kind: NotificationKind,
 }
 
 fn save_to_backend(groups: Vec<FavoriteGroup>, custom_order: Vec<String>, sort_order: String) {
@@ -80,49 +88,47 @@ fn make_group_id(name: &str, existing: &[FavoriteGroup]) -> String {
 
 #[function_component(App)]
 fn app() -> Html {
-    let stacks           = use_state(Vec::<Stack>::new);
-    let containers       = use_state(Vec::<Container>::new);
-    let favorite_groups  = use_state(Vec::<FavoriteGroup>::new);
-    let custom_order     = use_state(Vec::<String>::new);
-    let sort_order       = use_state(|| "custom".to_string());
-    let settings_open    = use_state(|| false);
-    let error            = use_state(|| None::<String>);
+    let stacks             = use_state(Vec::<Stack>::new);
+    let containers         = use_state(Vec::<Container>::new);
+    let favorite_groups    = use_state(Vec::<FavoriteGroup>::new);
+    let custom_order       = use_state(Vec::<String>::new);
+    let sort_order         = use_state(|| "custom".to_string());
+    let settings_open      = use_state(|| false);
+    let error              = use_state(|| None::<String>);
     let initial_fetch_done = use_state(|| false);
-    let search_query     = use_state(|| String::new());
-    let server_ip        = use_state(|| String::new());
-    let notifications    = use_state(Vec::<Notification>::new);
-    let notif_counter    = use_mut_ref(|| 0u32);
+    let search_query       = use_state(String::new);
+    let server_ip          = use_state(String::new);
+
+    // Notifications backed by RefCell so concurrent async tasks never overwrite each other
+    let notifications      = use_state(Vec::<Notification>::new);
+    let notif_list_ref     = use_mut_ref(Vec::<Notification>::new);
+    let notif_counter      = use_mut_ref(|| 0u32);
+
+    // Pending actions state (stack_id -> "start"|"stop", container_id -> "start"|"stop"|"restart")
+    let pending_stacks         = use_state(HashMap::<u32, String>::new);
+    let pending_stacks_ref     = use_mut_ref(HashMap::<u32, String>::new);
+    let pending_containers     = use_state(HashMap::<String, String>::new);
+    let pending_containers_ref = use_mut_ref(HashMap::<String, String>::new);
+
     // None = all stacks; Some(group_id) = filter to that group
-    let active_filter    = use_state(|| None::<String>);
+    let active_filter      = use_state(|| None::<String>);
     // Some(stack_name) = star popup open for that stack
-    let star_popup       = use_state(|| None::<String>);
-    // Create / rename group modals
-    let show_create_group = use_state(|| false);
-    let rename_group      = use_state(|| None::<FavoriteGroup>);
+    let star_popup         = use_state(|| None::<String>);
+    // Create / rename / delete group modals
+    let show_create_group    = use_state(|| false);
+    let rename_group         = use_state(|| None::<FavoriteGroup>);
     let confirm_delete_group = use_state(|| None::<FavoriteGroup>);
-    let dragged_stack    = use_state(|| None::<String>);
-    let drag_over_stack  = use_state(|| None::<String>);
+    let dragged_stack        = use_state(|| None::<String>);
+    let drag_over_stack      = use_state(|| None::<String>);
 
     // ── Notifications ─────────────────────────────────────────────────────────
     let dismiss_notification = {
         let notifications = notifications.clone();
+        let notif_list_ref = notif_list_ref.clone();
         Callback::from(move |id: u32| {
-            let mut n = (*notifications).clone();
-            n.retain(|x| x.id != id);
-            notifications.set(n);
-        })
-    };
-    let push_notification = {
-        let notifications = notifications.clone();
-        let counter = notif_counter.clone();
-        let dismiss = dismiss_notification.clone();
-        Callback::from(move |(msg, ok): (String, bool)| {
-            let id = { let mut c = counter.borrow_mut(); *c += 1; *c };
-            let mut n = (*notifications).clone();
-            n.push(Notification { id, message: msg, success: ok });
-            notifications.set(n);
-            let d = dismiss.clone();
-            gloo_timers::callback::Timeout::new(4000, move || d.emit(id)).forget();
+            let mut list = notif_list_ref.borrow_mut();
+            list.retain(|x| x.id != id);
+            notifications.set(list.clone());
         })
     };
 
@@ -161,7 +167,12 @@ fn app() -> Html {
                     initial_fetch_done.set(true);
                 }
                 match Request::get("/api/stacks").send().await {
-                    Ok(res) => { if let Ok(d) = res.json::<Vec<Stack>>().await { stacks.set(d); } }
+                    Ok(res) => {
+                        if let Ok(d) = res.json::<Vec<Stack>>().await {
+                            stacks.set(d);
+                            error.set(None);
+                        }
+                    }
                     Err(e) => error.set(Some(e.to_string())),
                 }
                 match Request::get("/api/containers").send().await {
@@ -171,45 +182,240 @@ fn app() -> Html {
             });
         })
     };
-    { let fd = fetch_data.clone();
-      use_effect_with((), move |_| {
-          fd.emit(());
-          let iv = gloo_timers::callback::Interval::new(5000, move || fd.emit(()));
-          || drop(iv)
-      });
+    {
+        let fd = fetch_data.clone();
+        use_effect_with((), move |_| {
+            fd.emit(());
+            let iv = gloo_timers::callback::Interval::new(5000, move || fd.emit(()));
+            || drop(iv)
+        });
     }
 
-    // ── Stack / container actions ─────────────────────────────────────────────
+    // ── Stack / container actions with loading state & completion toast ───────
     let toggle_stack = {
-        let fetch_data = fetch_data.clone(); let push_notification = push_notification.clone();
+        let stacks = stacks.clone();
+        let containers = containers.clone();
+        let pending_stacks = pending_stacks.clone();
+        let pending_stacks_ref = pending_stacks_ref.clone();
+        let notifications = notifications.clone();
+        let notif_list_ref = notif_list_ref.clone();
+        let notif_counter = notif_counter.clone();
+        let dismiss = dismiss_notification.clone();
+
         Callback::from(move |(id, name, running): (u32, String, bool)| {
-            let fd = fetch_data.clone(); let pn = push_notification.clone();
+            let action = if running { "stop" } else { "start" };
+
+            // Mark stack as pending immediately
+            {
+                let mut map = pending_stacks_ref.borrow_mut();
+                if map.contains_key(&id) {
+                    return;
+                }
+                map.insert(id, action.to_string());
+                pending_stacks.set(map.clone());
+            }
+
+            // Show immediate loading toast
+            let loading_notif_id = {
+                let mut c = notif_counter.borrow_mut();
+                *c += 1;
+                *c
+            };
+            let loading_msg = if running {
+                format!("Arrêt de la stack « {} » en cours...", name)
+            } else {
+                format!("Démarrage de la stack « {} » en cours...", name)
+            };
+            {
+                let mut list = notif_list_ref.borrow_mut();
+                list.push(Notification {
+                    id: loading_notif_id,
+                    message: loading_msg,
+                    kind: NotificationKind::Loading,
+                });
+                notifications.set(list.clone());
+            }
+
+            let stacks = stacks.clone();
+            let containers = containers.clone();
+            let pending_stacks = pending_stacks.clone();
+            let pending_stacks_ref = pending_stacks_ref.clone();
+            let notifications = notifications.clone();
+            let notif_list_ref = notif_list_ref.clone();
+            let notif_counter = notif_counter.clone();
+            let dismiss = dismiss.clone();
+
             wasm_bindgen_futures::spawn_local(async move {
-                let action = if running { "stop" } else { "start" };
-                let ok = Request::post(&format!("/api/stacks/{}/{}", id, action)).send().await.is_ok();
-                let msg = if running {
-                    if ok { format!("Stack '{}' arrêtée", name) } else { format!("Erreur : impossible d'arrêter '{}'", name) }
-                } else {
-                    if ok { format!("Stack '{}' démarrée", name) } else { format!("Erreur : impossible de démarrer '{}'", name) }
+                let ok = match Request::post(&format!("/api/stacks/{}/{}", id, action)).send().await {
+                    Ok(res) => res.ok(),
+                    Err(_) => false,
                 };
-                pn.emit((msg, ok)); fd.emit(());
-            });
-        })
-    };
-    let toggle_container = {
-        let fetch_data = fetch_data.clone(); let push_notification = push_notification.clone();
-        Callback::from(move |(id, name, action): (String, String, String)| {
-            let fd = fetch_data.clone(); let pn = push_notification.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                let ok = Request::post(&format!("/api/containers/{}/{}", id, action)).send().await.is_ok();
-                let word = match action.as_str() { "start" => "démarré", "stop" => "arrêté", _ => "redémarré" };
-                let msg = if ok { format!("Conteneur '{}' {}", name, word) } else { format!("Erreur sur '{}'", name) };
-                pn.emit((msg, ok)); fd.emit(());
+
+                // Refresh stacks and containers before clearing the loading state
+                if let Ok(res) = Request::get("/api/stacks").send().await {
+                    if let Ok(d) = res.json::<Vec<Stack>>().await {
+                        stacks.set(d);
+                    }
+                }
+                if let Ok(res) = Request::get("/api/containers").send().await {
+                    if let Ok(d) = res.json::<Vec<Container>>().await {
+                        containers.set(d);
+                    }
+                }
+
+                // Clear pending state on stack
+                {
+                    let mut map = pending_stacks_ref.borrow_mut();
+                    map.remove(&id);
+                    pending_stacks.set(map.clone());
+                }
+
+                // Replace loading toast with completion toast
+                let done_notif_id = {
+                    let mut c = notif_counter.borrow_mut();
+                    *c += 1;
+                    *c
+                };
+                let done_msg = if running {
+                    if ok {
+                        format!("Stack « {} » arrêtée avec succès", name)
+                    } else {
+                        format!("Erreur : impossible d'arrêter la stack « {} »", name)
+                    }
+                } else if ok {
+                    format!("Stack « {} » démarrée avec succès", name)
+                } else {
+                    format!("Erreur : impossible de démarrer la stack « {} »", name)
+                };
+
+                {
+                    let mut list = notif_list_ref.borrow_mut();
+                    list.retain(|x| x.id != loading_notif_id);
+                    list.push(Notification {
+                        id: done_notif_id,
+                        message: done_msg,
+                        kind: if ok { NotificationKind::Success } else { NotificationKind::Error },
+                    });
+                    notifications.set(list.clone());
+                }
+
+                let d = dismiss.clone();
+                gloo_timers::callback::Timeout::new(4500, move || d.emit(done_notif_id)).forget();
             });
         })
     };
 
-    // ── Drag & drop ───────────────────────────────────────────────────────────
+    let toggle_container = {
+        let stacks = stacks.clone();
+        let containers = containers.clone();
+        let pending_containers = pending_containers.clone();
+        let pending_containers_ref = pending_containers_ref.clone();
+        let notifications = notifications.clone();
+        let notif_list_ref = notif_list_ref.clone();
+        let notif_counter = notif_counter.clone();
+        let dismiss = dismiss_notification.clone();
+
+        Callback::from(move |(id, name, action): (String, String, String)| {
+            // Mark container as pending immediately
+            {
+                let mut map = pending_containers_ref.borrow_mut();
+                if map.contains_key(&id) {
+                    return;
+                }
+                map.insert(id.clone(), action.clone());
+                pending_containers.set(map.clone());
+            }
+
+            // Show immediate loading toast
+            let loading_notif_id = {
+                let mut c = notif_counter.borrow_mut();
+                *c += 1;
+                *c
+            };
+            let loading_msg = match action.as_str() {
+                "start" => format!("Démarrage du conteneur « {} » en cours...", name),
+                "stop" => format!("Arrêt du conteneur « {} » en cours...", name),
+                _ => format!("Relance du conteneur « {} » en cours...", name),
+            };
+            {
+                let mut list = notif_list_ref.borrow_mut();
+                list.push(Notification {
+                    id: loading_notif_id,
+                    message: loading_msg,
+                    kind: NotificationKind::Loading,
+                });
+                notifications.set(list.clone());
+            }
+
+            let stacks = stacks.clone();
+            let containers = containers.clone();
+            let pending_containers = pending_containers.clone();
+            let pending_containers_ref = pending_containers_ref.clone();
+            let notifications = notifications.clone();
+            let notif_list_ref = notif_list_ref.clone();
+            let notif_counter = notif_counter.clone();
+            let dismiss = dismiss.clone();
+
+            wasm_bindgen_futures::spawn_local(async move {
+                let ok = match Request::post(&format!("/api/containers/{}/{}", id, action)).send().await {
+                    Ok(res) => res.ok(),
+                    Err(_) => false,
+                };
+
+                // Refresh containers and stacks before clearing the loading state
+                if let Ok(res) = Request::get("/api/containers").send().await {
+                    if let Ok(d) = res.json::<Vec<Container>>().await {
+                        containers.set(d);
+                    }
+                }
+                if let Ok(res) = Request::get("/api/stacks").send().await {
+                    if let Ok(d) = res.json::<Vec<Stack>>().await {
+                        stacks.set(d);
+                    }
+                }
+
+                // Clear pending state on container
+                {
+                    let mut map = pending_containers_ref.borrow_mut();
+                    map.remove(&id);
+                    pending_containers.set(map.clone());
+                }
+
+                // Replace loading toast with completion toast
+                let done_notif_id = {
+                    let mut c = notif_counter.borrow_mut();
+                    *c += 1;
+                    *c
+                };
+                let word = match action.as_str() {
+                    "start" => "démarré",
+                    "stop" => "arrêté",
+                    _ => "relancé",
+                };
+                let done_msg = if ok {
+                    format!("Conteneur « {} » {} avec succès", name, word)
+                } else {
+                    format!("Erreur lors de l'action sur le conteneur « {} »", name)
+                };
+
+                {
+                    let mut list = notif_list_ref.borrow_mut();
+                    list.retain(|x| x.id != loading_notif_id);
+                    list.push(Notification {
+                        id: done_notif_id,
+                        message: done_msg,
+                        kind: if ok { NotificationKind::Success } else { NotificationKind::Error },
+                    });
+                    notifications.set(list.clone());
+                }
+
+                let d = dismiss.clone();
+                gloo_timers::callback::Timeout::new(4500, move || d.emit(done_notif_id)).forget();
+            });
+        })
+    };
+
+    // ── Drag & drop + mobile touch reorder ────────────────────────────────────
     let handle_drop = {
         let custom_order = custom_order.clone(); let sort_order = sort_order.clone();
         let dragged_stack = dragged_stack.clone(); let drag_over_stack = drag_over_stack.clone();
@@ -219,6 +425,9 @@ fn app() -> Html {
                 if dragged != target {
                     let mut order = (*custom_order).clone();
                     if order.is_empty() { order = all_stacks.iter().map(|s| s.name.clone()).collect(); }
+                    for s in all_stacks.iter() {
+                        if !order.contains(&s.name) { order.push(s.name.clone()); }
+                    }
                     if let Some(di) = order.iter().position(|x| *x == dragged) {
                         order.remove(di);
                         if let Some(ti) = order.iter().position(|x| *x == target) { order.insert(ti, dragged); }
@@ -233,6 +442,35 @@ fn app() -> Html {
                 }
             }
             dragged_stack.set(None); drag_over_stack.set(None);
+        })
+    };
+
+    let move_stack_step = {
+        let custom_order = custom_order.clone();
+        let sort_order = sort_order.clone();
+        let all_stacks = stacks.clone();
+        let favorite_groups = favorite_groups.clone();
+        Callback::from(move |(stack_name, delta): (String, isize)| {
+            let mut order = (*custom_order).clone();
+            if order.is_empty() {
+                order = all_stacks.iter().map(|s| s.name.clone()).collect();
+            } else {
+                for s in all_stacks.iter() {
+                    if !order.contains(&s.name) {
+                        order.push(s.name.clone());
+                    }
+                }
+            }
+            if let Some(pos) = order.iter().position(|x| *x == stack_name) {
+                let new_pos = pos as isize + delta;
+                if new_pos >= 0 && (new_pos as usize) < order.len() {
+                    order.swap(pos, new_pos as usize);
+                    let new_sort = "custom".to_string();
+                    custom_order.set(order.clone());
+                    sort_order.set(new_sort.clone());
+                    save_to_backend((*favorite_groups).clone(), order, new_sort);
+                }
+            }
         })
     };
 
@@ -291,7 +529,12 @@ fn app() -> Html {
         _ => {}
     }
 
-    // Pre-compute star popup — Yew html! doesn't allow `let` bindings inside if-let branches
+    let total_stacks = stacks.len();
+    let active_stacks_count = stacks.iter().filter(|s| s.status == 1).count();
+    let can_reorder_touch = *sort_order == "custom" && query.is_empty() && active_filter.is_none();
+    let filtered_len = filtered_stacks.len();
+
+    // Pre-compute star popup
     let star_popup_frag: Html = if let Some(popup_stack) = (*star_popup).clone() {
         let close1 = { let sp = star_popup.clone(); Callback::from(move |_: MouseEvent| sp.set(None)) };
         let close2 = { let sp = star_popup.clone(); Callback::from(move |_: MouseEvent| sp.set(None)) };
@@ -302,7 +545,7 @@ fn app() -> Html {
         };
         let groups_snap = (*favorite_groups).clone();
         let empty_msg: Html = if groups_snap.is_empty() {
-            html! { <p class="mini-popup-empty">{ "Aucun groupe. Créez-en un avec le bouton ＋." }</p> }
+            html! { <p class="mini-popup-empty">{ "Aucun groupe. Créez-en un avec le bouton ci-dessous." }</p> }
         } else { html! {} };
         let group_rows: Html = groups_snap.iter().map(|g| {
             let in_group = g.stacks.contains(&popup_stack.to_lowercase());
@@ -323,7 +566,7 @@ fn app() -> Html {
                 <div class="mini-popup" onclick={Callback::from(|e: MouseEvent| e.stop_propagation())}>
                     <div class="mini-popup-header">
                         <span>{ format!("Favoris — {}", popup_stack) }</span>
-                        <button class="mini-popup-close" onclick={close2}>{ "×" }</button>
+                        <button class="mini-popup-close" onclick={close2} aria-label="Fermer">{ "×" }</button>
                     </div>
                     { empty_msg }
                     { group_rows }
@@ -392,115 +635,199 @@ fn app() -> Html {
     } else { html! {} };
 
     html! {
-        <>
-            // ── Header ────────────────────────────────────────────────────────
-            <header>
-                <div class="logo">{ "⚡ Plustainer" }</div>
-                <div style="display:flex;gap:0.75rem;align-items:center;">
-                    <input type="text" placeholder="Rechercher..." value={(*search_query).clone()}
-                        oninput={
-                            let sq = search_query.clone();
-                            Callback::from(move |e: InputEvent| {
-                                let i: web_sys::HtmlInputElement = e.target_unchecked_into();
-                                sq.set(i.value());
-                            })
+        <div class="app-shell">
+            // ── Sticky Top Area (Header + Filter Bar) ─────────────────────────
+            <div class="top-sticky">
+                <header class="app-header">
+                    <div class="header-brand">
+                        <div class="logo">{ "⚡ Plustainer" }</div>
+                        if total_stacks > 0 {
+                            <span class="header-stats" title="Stacks actives / total">
+                                { format!("{}/{} actives", active_stacks_count, total_stacks) }
+                            </span>
                         }
-                        style="padding:0.45rem 1rem;border-radius:20px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.12);color:white;outline:none;font-size:0.9rem;"
-                    />
-                    <button class="btn" onclick={
-                        let so = settings_open.clone();
-                        Callback::from(move |_: MouseEvent| so.set(!*so))
-                    }>{ "⚙️ Paramètres" }</button>
-                    <button class="btn" onclick={move |_| fetch_data.emit(())}>{ "🔄" }</button>
-                </div>
-            </header>
-
-            // ── Filter bar ────────────────────────────────────────────────────
-            <div class="filter-bar">
-                // "Toutes"
-                <button
-                    class={if active_filter.is_none() { "filter-pill filter-pill--active" } else { "filter-pill" }}
-                    onclick={ let af = active_filter.clone(); Callback::from(move |_: MouseEvent| af.set(None)) }
-                >{ "Toutes" }</button>
-
-                // One pill per favorites group
-                {
-                    (*favorite_groups).iter().map(|g| {
-                        let gid = g.id.clone();
-                        let gid_active = g.id.clone();
-                        let is_active = active_filter.as_deref() == Some(&gid_active);
-                        let count = g.stacks.len();
-                        let g_for_rename = g.clone();
-
-                        let g_for_delete = g.clone();
-                        let cdg = confirm_delete_group.clone();
-
-                        html! {
-                            <div class={if is_active { "group-pill group-pill--active" } else { "group-pill" }}>
-                                <span class="group-pill-label" onclick={
-                                    let af = active_filter.clone();
-                                    Callback::from(move |_: MouseEvent| af.set(Some(gid.clone())))
-                                }>
-                                    { &g.name }
-                                    if count > 0 {
-                                        <span class="group-pill-count">{ count }</span>
+                    </div>
+                    <div class="header-controls">
+                        <div class="search-box">
+                            <span class="search-icon">{ "🔍" }</span>
+                            <input
+                                class="search-input"
+                                type="search"
+                                placeholder="Rechercher stack ou conteneur..."
+                                value={(*search_query).clone()}
+                                oninput={
+                                    let sq = search_query.clone();
+                                    Callback::from(move |e: InputEvent| {
+                                        let i: web_sys::HtmlInputElement = e.target_unchecked_into();
+                                        sq.set(i.value());
+                                    })
+                                }
+                            />
+                            if !search_query.is_empty() {
+                                <button
+                                    class="search-clear"
+                                    title="Effacer la recherche"
+                                    onclick={
+                                        let sq = search_query.clone();
+                                        Callback::from(move |_: MouseEvent| sq.set(String::new()))
                                     }
-                                </span>
-                                <div class="group-pill-actions">
-                                    <button class="group-pill-btn group-pill-edit" title="Renommer"
-                                        onclick={
-                                            let rg = rename_group.clone();
-                                            Callback::from(move |e: MouseEvent| {
-                                                e.stop_propagation();
-                                                rg.set(Some(g_for_rename.clone()));
-                                            })
-                                        }
-                                    >{ "✏" }</button>
-                                    <button class="group-pill-btn group-pill-delete" title="Supprimer"
-                                        onclick={
-                                            Callback::from(move |e: MouseEvent| {
-                                                e.stop_propagation();
-                                                cdg.set(Some(g_for_delete.clone()));
-                                            })
-                                        }
-                                    >{ "×" }</button>
-                                </div>
-                            </div>
-                        }
-                    }).collect::<Html>()
-                }
+                                >{ "×" }</button>
+                            }
+                        </div>
+                        <div class="header-buttons">
+                            <button class="btn btn-header" title="Paramètres d'affichage" onclick={
+                                let so = settings_open.clone();
+                                Callback::from(move |_: MouseEvent| so.set(!*so))
+                            }>
+                                <span>{ "⚙️" }</span>
+                                <span class="btn-label">{ "Paramètres" }</span>
+                            </button>
+                            <button class="btn btn-header btn-refresh" title="Rafraîchir" onclick={move |_| fetch_data.emit(())}>
+                                { "🔄" }
+                            </button>
+                        </div>
+                    </div>
+                </header>
 
-                // "+" create new group
-                <button class="filter-pill-add" title="Nouveau groupe de favoris"
-                    onclick={
-                        let scg = show_create_group.clone();
-                        Callback::from(move |_: MouseEvent| scg.set(true))
+                // ── Filter bar ────────────────────────────────────────────────
+                <div class="filter-bar">
+                    // "Toutes"
+                    <button
+                        class={if active_filter.is_none() { "filter-pill filter-pill--active" } else { "filter-pill" }}
+                        onclick={ let af = active_filter.clone(); Callback::from(move |_: MouseEvent| af.set(None)) }
+                    >
+                        <span>{ "Toutes" }</span>
+                        if total_stacks > 0 {
+                            <span class="filter-pill-count">{ total_stacks }</span>
+                        }
+                    </button>
+
+                    // One pill per favorites group — single click immediately selects group
+                    {
+                        (*favorite_groups).iter().map(|g| {
+                            let gid = g.id.clone();
+                            let gid_active = g.id.clone();
+                            let is_active = active_filter.as_deref() == Some(&gid_active);
+                            let count = g.stacks.len();
+                            let g_for_rename = g.clone();
+                            let g_for_delete = g.clone();
+                            let cdg = confirm_delete_group.clone();
+
+                            html! {
+                                <div
+                                    class={if is_active { "group-pill group-pill--active" } else { "group-pill" }}
+                                    onclick={
+                                        let af = active_filter.clone();
+                                        Callback::from(move |_: MouseEvent| af.set(Some(gid.clone())))
+                                    }
+                                >
+                                    <span class="group-pill-label">
+                                        { &g.name }
+                                        if count > 0 {
+                                            <span class="group-pill-count">{ count }</span>
+                                        }
+                                    </span>
+                                    if is_active {
+                                        <div class="group-pill-actions">
+                                            <button class="group-pill-btn group-pill-edit" title="Renommer"
+                                                onclick={
+                                                    let rg = rename_group.clone();
+                                                    Callback::from(move |e: MouseEvent| {
+                                                        e.stop_propagation();
+                                                        rg.set(Some(g_for_rename.clone()));
+                                                    })
+                                                }
+                                            >{ "✏" }</button>
+                                            <button class="group-pill-btn group-pill-delete" title="Supprimer"
+                                                onclick={
+                                                    Callback::from(move |e: MouseEvent| {
+                                                        e.stop_propagation();
+                                                        cdg.set(Some(g_for_delete.clone()));
+                                                    })
+                                                }
+                                            >{ "×" }</button>
+                                        </div>
+                                    }
+                                </div>
+                            }
+                        }).collect::<Html>()
                     }
-                >{ "＋" }</button>
+
+                    // "+" create new group
+                    <button class="filter-pill-add" title="Nouveau groupe de favoris"
+                        onclick={
+                            let scg = show_create_group.clone();
+                            Callback::from(move |_: MouseEvent| scg.set(true))
+                        }
+                    >{ "＋" }</button>
+                </div>
             </div>
 
             // ── Main grid ─────────────────────────────────────────────────────
-            <main>
+            <main class="main-content">
                 if let Some(err) = &*error {
-                    <div style="color:red;padding:2rem;">{ format!("Erreur: {}", err) }</div>
+                    <div class="error-banner">{ format!("⚠️ Erreur de connexion API : {}", err) }</div>
                 }
                 if let Some(ref g) = active_group {
                     <div class="page-banner">
                         <div class="page-banner-title">{ format!("⭐ {}", g.name) }</div>
-                        <button class="btn" style="font-size:0.8rem;" onclick={
-                            let af = active_filter.clone();
-                            Callback::from(move |_: MouseEvent| af.set(None))
-                        }>{ "Voir toutes les stacks" }</button>
+                        <div class="page-banner-actions">
+                            <button class="btn btn-sm btn-ghost" onclick={
+                                let rg = rename_group.clone();
+                                let g_clone = g.clone();
+                                Callback::from(move |_: MouseEvent| rg.set(Some(g_clone.clone())))
+                            }>{ "✏ Renommer" }</button>
+                            <button class="btn btn-sm btn-ghost btn-ghost-danger" onclick={
+                                let cdg = confirm_delete_group.clone();
+                                let g_clone = g.clone();
+                                Callback::from(move |_: MouseEvent| cdg.set(Some(g_clone.clone())))
+                            }>{ "🗑" }</button>
+                            <button class="btn btn-sm" onclick={
+                                let af = active_filter.clone();
+                                Callback::from(move |_: MouseEvent| af.set(None))
+                            }>{ "Voir toutes" }</button>
+                        </div>
                     </div>
                 }
-                <div class="stacks-grid" style="animation:fadeIn 0.3s ease-out;">
+                if *initial_fetch_done && filtered_stacks.is_empty() {
+                    <div class="empty-state">
+                        <div class="empty-state-icon">{ "📦" }</div>
+                        <p class="empty-state-text">
+                            {
+                                if !query.is_empty() {
+                                    format!("Aucune stack ou conteneur ne correspond à « {} ».", *search_query)
+                                } else if active_group.is_some() {
+                                    "Aucune stack dans ce groupe de favoris. Touchez ☆ sur une stack pour l'ajouter.".to_string()
+                                } else {
+                                    "Aucune stack trouvée.".to_string()
+                                }
+                            }
+                        </p>
+                        if !query.is_empty() || active_group.is_some() {
+                            <button class="btn" onclick={
+                                let sq = search_query.clone();
+                                let af = active_filter.clone();
+                                Callback::from(move |_: MouseEvent| {
+                                    sq.set(String::new());
+                                    af.set(None);
+                                })
+                            }>{ "Réinitialiser les filtres" }</button>
+                        }
+                    </div>
+                }
+                <div class="stacks-grid">
                     {
-                        filtered_stacks.iter().map(|stack| {
+                        filtered_stacks.iter().enumerate().map(|(idx, stack)| {
                             let is_active = stack.status == 1;
                             let sname = stack.name.clone();
                             let sname_drop = stack.name.clone();
                             let sname_star = stack.name.clone();
+                            let sname_up = stack.name.clone();
+                            let sname_down = stack.name.clone();
                             let sid = stack.id;
+
+                            let stack_pending_action = pending_stacks.get(&sid).cloned();
+                            let is_stack_loading = stack_pending_action.is_some();
 
                             let in_any_group = favorite_groups.iter()
                                 .any(|g| g.stacks.contains(&stack.name.to_lowercase()));
@@ -522,6 +849,20 @@ fn app() -> Html {
                                 Callback::from(move |e: MouseEvent| {
                                     e.stop_propagation();
                                     sp.set(Some(name.clone()));
+                                })
+                            };
+                            let on_move_up = {
+                                let ms = move_stack_step.clone();
+                                Callback::from(move |e: MouseEvent| {
+                                    e.stop_propagation();
+                                    ms.emit((sname_up.clone(), -1));
+                                })
+                            };
+                            let on_move_down = {
+                                let ms = move_stack_step.clone();
+                                Callback::from(move |e: MouseEvent| {
+                                    e.stop_propagation();
+                                    ms.emit((sname_down.clone(), 1));
                                 })
                             };
                             let on_drag_start = {
@@ -547,39 +888,100 @@ fn app() -> Html {
 
                             let mut card_class = "stack-card".to_string();
                             if *drag_over_stack == Some(stack.name.clone()) { card_class.push_str(" drag-over"); }
+                            if is_stack_loading { card_class.push_str(" is-loading"); }
+
+                            let stack_status_badge: Html = if let Some(ref act) = stack_pending_action {
+                                let txt = if act == "stop" { "Arrêt..." } else { "Démarrage..." };
+                                html! {
+                                    <span class="status loading">
+                                        <span class="spinner spinner-xs"></span>
+                                        { txt }
+                                    </span>
+                                }
+                            } else if is_active {
+                                html! { <span class="status active">{ "Active" }</span> }
+                            } else {
+                                html! { <span class="status stopped">{ "Stoppée" }</span> }
+                            };
+
+                            let stack_btn_content: Html = if let Some(ref act) = stack_pending_action {
+                                let txt = if act == "stop" { "Arrêt..." } else { "Démarrage..." };
+                                html! {
+                                    <>
+                                        <span class="spinner"></span>
+                                        <span>{ txt }</span>
+                                    </>
+                                }
+                            } else if is_active {
+                                html! { <>{ "■ Stopper" }</> }
+                            } else {
+                                html! { <>{ "▶ Démarrer" }</> }
+                            };
 
                             html! {
                                 <div class={card_class} draggable="true"
                                      ondragstart={on_drag_start} ondragover={on_drag_over}
                                      ondragleave={on_drag_leave} ondrop={on_drop}>
                                     <div class="stack-header">
-                                        <div style="display:flex;align-items:flex-start;gap:0.5rem;min-width:0;">
+                                        <div class="stack-title-group">
                                             <button
                                                 class={if in_any_group { "star-btn star-btn--on" } else { "star-btn" }}
                                                 onclick={on_star}
                                                 title="Gérer les favoris"
                                             >{ if in_any_group { "★" } else { "☆" } }</button>
-                                            <div style="min-width:0;">
-                                                <h3 style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{ &stack.name }</h3>
-                                                <span class={if is_active { "status active" } else { "status stopped" }}>
-                                                    { if is_active { "Active" } else { "Stoppée" } }
-                                                </span>
-                                                <span style="font-size:0.8rem;margin-left:0.5rem;">
-                                                    { format!("{}/{} conteneurs", running_count, stack_containers.len()) }
-                                                </span>
+                                            <div class="stack-meta">
+                                                <h3 class="stack-name" title={stack.name.clone()}>{ &stack.name }</h3>
+                                                <div class="stack-submeta">
+                                                    { stack_status_badge }
+                                                    <span class="stack-count">
+                                                        { format!("{}/{} conteneurs", running_count, stack_containers.len()) }
+                                                    </span>
+                                                </div>
                                             </div>
                                         </div>
-                                        <button class={if is_active { "btn btn-danger" } else { "btn" }} onclick={on_toggle} style="flex-shrink:0;margin-left:0.5rem;">
-                                            { if is_active { "■ Stopper" } else { "▶ Démarrer" } }
-                                        </button>
+                                        <div class="stack-header-actions">
+                                            if can_reorder_touch && filtered_len > 1 {
+                                                <div class="reorder-btns">
+                                                    <button
+                                                        class="reorder-btn"
+                                                        disabled={idx == 0}
+                                                        onclick={on_move_up}
+                                                        title="Monter"
+                                                    >{ "↑" }</button>
+                                                    <button
+                                                        class="reorder-btn"
+                                                        disabled={idx + 1 >= filtered_len}
+                                                        onclick={on_move_down}
+                                                        title="Descendre"
+                                                    >{ "↓" }</button>
+                                                </div>
+                                            }
+                                            <button
+                                                class={if is_stack_loading {
+                                                    "btn btn-stack-toggle is-loading"
+                                                } else if is_active {
+                                                    "btn btn-danger btn-stack-toggle"
+                                                } else {
+                                                    "btn btn-stack-toggle"
+                                                }}
+                                                disabled={is_stack_loading}
+                                                onclick={on_toggle}
+                                            >
+                                                { stack_btn_content }
+                                            </button>
+                                        </div>
                                     </div>
 
                                     <div class="containers-list">
                                         {
                                             stack_containers.iter().map(|c| {
                                                 let cid   = c.id.clone();
-                                                let cname = c.names.get(0).cloned().unwrap_or_default().replace("/", "");
+                                                let cname = c.names.get(0).cloned().unwrap_or_default().replace('/', "");
                                                 let running = c.state == "running";
+
+                                                let container_pending = pending_containers.get(&cid).cloned();
+                                                let is_container_loading = container_pending.is_some();
+
                                                 let mk = |act: &'static str| {
                                                     let tc = toggle_container.clone();
                                                     let id = cid.clone(); let n = cname.clone();
@@ -608,31 +1010,65 @@ fn app() -> Html {
                                                 pub_ports.sort(); pub_ports.dedup();
                                                 let sip = (*server_ip).clone();
 
+                                                let pending_label: Html = if let Some(ref act) = container_pending {
+                                                    let word = match act.as_str() {
+                                                        "start" => "Démarrage...",
+                                                        "stop" => "Arrêt...",
+                                                        _ => "Relance...",
+                                                    };
+                                                    html! {
+                                                        <span class="container-pending-badge">
+                                                            <span class="spinner spinner-xs"></span>
+                                                            { word }
+                                                        </span>
+                                                    }
+                                                } else {
+                                                    html! {}
+                                                };
+
                                                 html! {
-                                                    <div class="container-item" style="flex-direction:column;align-items:stretch;gap:0.5rem;padding:0.5rem;">
-                                                        <div style="display:flex;justify-content:space-between;align-items:center;width:100%;">
-                                                            <span style={if running { "color:#22c55e" } else { "color:#ef4444" }}>
-                                                                { if running { "🟢" } else { "🔴" } }{ " " }{ cname }
-                                                            </span>
-                                                            <div>
-                                                                if !running {
-                                                                    <button class="btn" style="padding:0.2rem 0.5rem;margin-left:0.5rem;" onclick={on_start}>{ "▶" }</button>
+                                                    <div class={if is_container_loading { "container-item is-loading" } else { "container-item" }}>
+                                                        <div class="container-row">
+                                                            <div class="container-info" title={cname.clone()}>
+                                                                <span class="container-dot">
+                                                                    { if is_container_loading { "⏳" } else if running { "🟢" } else { "🔴" } }
+                                                                </span>
+                                                                <span class={if running { "container-name running" } else { "container-name stopped" }}>
+                                                                    { &cname }
+                                                                </span>
+                                                                { pending_label }
+                                                            </div>
+                                                            <div class="container-actions">
+                                                                if is_container_loading {
+                                                                    <button class="btn btn-icon-action is-loading" disabled=true>
+                                                                        <span class="spinner"></span>
+                                                                    </button>
+                                                                } else if !running {
+                                                                    <button class="btn btn-icon-action" title="Démarrer" disabled={is_stack_loading} onclick={on_start}>{ "▶" }</button>
                                                                 } else {
-                                                                    <button class="btn btn-danger" style="padding:0.2rem 0.5rem;margin-left:0.5rem;" onclick={on_stop}>{ "■" }</button>
-                                                                    <button class="btn" style="padding:0.2rem 0.5rem;margin-left:0.5rem;" onclick={on_restart}>{ "↻" }</button>
+                                                                    <button class="btn btn-danger btn-icon-action" title="Arrêter" disabled={is_stack_loading} onclick={on_stop}>{ "■" }</button>
+                                                                    <button class="btn btn-icon-action" title="Redémarrer" disabled={is_stack_loading} onclick={on_restart}>{ "↻" }</button>
                                                                 }
                                                             </div>
                                                         </div>
                                                         if !urls.is_empty() || !pub_ports.is_empty() {
-                                                            <div style="display:flex;gap:0.5rem;flex-wrap:wrap;font-size:0.8rem;margin-left:1.5rem;">
+                                                            <div class="container-links">
                                                                 { for urls.iter().map(|url| html! {
-                                                                    <a href={url.clone()} target="_blank" style="color:#60a5fa;text-decoration:none;background:rgba(96,165,250,0.1);padding:0.1rem 0.4rem;border-radius:4px;display:inline-flex;align-items:center;gap:0.2rem;">{"🔗"}{url.replace("http://","").replace("https://","")}</a>
+                                                                    <a href={url.clone()} target="_blank" rel="noopener noreferrer" class="link-chip link-chip--url">
+                                                                        <span>{"🔗"}</span>
+                                                                        <span>{url.replace("http://","").replace("https://","")}</span>
+                                                                    </a>
                                                                 }) }
                                                                 { for pub_ports.iter().map(|port| {
                                                                     let host = if !sip.is_empty() { sip.clone() } else {
                                                                         web_sys::window().and_then(|w| w.location().hostname().ok()).unwrap_or_else(|| "localhost".to_string())
                                                                     };
-                                                                    html! { <a href={format!("http://{}:{}", host, port)} target="_blank" style="color:#34d399;text-decoration:none;background:rgba(52,211,153,0.1);padding:0.1rem 0.4rem;border-radius:4px;display:inline-flex;align-items:center;gap:0.2rem;">{"🔌"}{port}</a> }
+                                                                    html! {
+                                                                        <a href={format!("http://{}:{}", host, port)} target="_blank" rel="noopener noreferrer" class="link-chip link-chip--port">
+                                                                            <span>{"🔌"}</span>
+                                                                            <span>{port}</span>
+                                                                        </a>
+                                                                    }
                                                                 }) }
                                                             </div>
                                                         }
@@ -655,10 +1091,21 @@ fn app() -> Html {
             <div class="toast-container">
                 {
                     (*notifications).iter().map(|n| {
-                        let id = n.id; let d = dismiss_notification.clone();
+                        let id = n.id;
+                        let d = dismiss_notification.clone();
+                        let toast_class = match n.kind {
+                            NotificationKind::Loading => "toast toast-loading",
+                            NotificationKind::Success => "toast toast-success",
+                            NotificationKind::Error   => "toast toast-error",
+                        };
+                        let icon_html: Html = match n.kind {
+                            NotificationKind::Loading => html! { <span class="spinner toast-spinner"></span> },
+                            NotificationKind::Success => html! { <span class="toast-icon">{ "✓" }</span> },
+                            NotificationKind::Error   => html! { <span class="toast-icon">{ "✕" }</span> },
+                        };
                         html! {
-                            <div class={if n.success { "toast toast-success" } else { "toast toast-error" }}>
-                                <span class="toast-icon">{ if n.success { "✓" } else { "✕" } }</span>
+                            <div class={toast_class}>
+                                { icon_html }
                                 <span class="toast-message">{ &n.message }</span>
                                 <button class="toast-close" onclick={Callback::from(move |_| d.emit(id))}>{ "×" }</button>
                             </div>
@@ -667,7 +1114,7 @@ fn app() -> Html {
                 }
             </div>
 
-            // ── Settings modal (sort order only) ─────────────────────────────
+            // ── Settings modal (sort order) ───────────────────────────────────
             if *settings_open {
                 <SettingsModal
                     sort_order={(*sort_order).clone()}
@@ -716,12 +1163,12 @@ fn app() -> Html {
                 />
             }
 
-            // ── Rename group modal (pre-computed above) ───────────────────────
+            // ── Rename group modal ────────────────────────────────────────────
             { rename_group_frag }
 
-            // ── Delete group confirmation modal (pre-computed above) ──────────
+            // ── Delete group confirmation modal ───────────────────────────────
             { confirm_delete_group_frag }
-        </>
+        </div>
     }
 }
 
@@ -736,26 +1183,30 @@ pub struct SettingsProps {
 #[function_component(SettingsModal)]
 fn settings_modal(props: &SettingsProps) -> Html {
     let sort = use_state(|| props.sort_order.clone());
-    let on_close = props.on_close.clone();
+    let on_close_bg = props.on_close.clone();
+    let on_close_btn = props.on_close.clone();
     let cb = props.on_save.clone();
     html! {
-        <div class="modal-overlay">
-            <div class="modal">
+        <div class="modal-overlay" onclick={move |_| on_close_bg.emit(())}>
+            <div class="modal" onclick={Callback::from(|e: MouseEvent| e.stop_propagation())}>
                 <h3>{ "Paramètres" }</h3>
-                <div style="margin:1rem 0;">
-                    <label style="font-size:0.8rem;color:#aaa;display:block;margin-bottom:0.5rem;">{ "Ordre d'affichage :" }</label>
-                    <select value={(*sort).clone()} onchange={
+                <div class="modal-field">
+                    <label class="modal-label">{ "Ordre d'affichage :" }</label>
+                    <select class="modal-select" value={(*sort).clone()} onchange={
                         let sort = sort.clone();
-                        Callback::from(move |e: Event| { let t: web_sys::HtmlSelectElement = e.target_unchecked_into(); sort.set(t.value()); })
-                    } style="width:100%;padding:0.5rem;background:#1a1a2e;color:white;border:1px solid rgba(255,255,255,0.1);border-radius:8px;">
-                        <option value="custom">{ "Personnalisé (Glisser-Déposer)" }</option>
+                        Callback::from(move |e: Event| {
+                            let t: web_sys::HtmlSelectElement = e.target_unchecked_into();
+                            sort.set(t.value());
+                        })
+                    }>
+                        <option value="custom">{ "Personnalisé (Glisser / ↑↓)" }</option>
                         <option value="default">{ "Par défaut" }</option>
                         <option value="alpha">{ "Alphabétique (A-Z)" }</option>
                         <option value="status">{ "Statut (Actives en premier)" }</option>
                     </select>
                 </div>
-                <div style="display:flex;gap:1rem;margin-top:1.5rem;">
-                    <button class="btn" style="background:#333;" onclick={move |_| on_close.emit(())}>{ "Annuler" }</button>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" onclick={move |_| on_close_btn.emit(())}>{ "Annuler" }</button>
                     <button class="btn" onclick={
                         let sort = sort.clone();
                         Callback::from(move |_| cb.emit((*sort).clone()))
@@ -778,13 +1229,15 @@ pub struct GroupNameProps {
 #[function_component(GroupNameModal)]
 fn group_name_modal(props: &GroupNameProps) -> Html {
     let name = use_state(|| props.initial_name.clone());
-    let on_close = props.on_close.clone();
+    let on_close_bg = props.on_close.clone();
+    let on_close_btn = props.on_close.clone();
     let cb = props.on_save.clone();
     html! {
-        <div class="modal-overlay">
-            <div class="modal" style="width:360px;">
+        <div class="modal-overlay" onclick={move |_| on_close_bg.emit(())}>
+            <div class="modal" onclick={Callback::from(|e: MouseEvent| e.stop_propagation())}>
                 <h3>{ &props.title }</h3>
                 <input
+                    class="modal-input"
                     type="text"
                     placeholder="Nom du groupe..."
                     value={(*name).clone()}
@@ -795,10 +1248,9 @@ fn group_name_modal(props: &GroupNameProps) -> Html {
                             name.set(i.value());
                         })
                     }
-                    style="width:100%;padding:0.6rem;background:#1a1a2e;color:white;border:1px solid rgba(255,255,255,0.1);border-radius:6px;font-size:0.95rem;margin-top:1rem;"
                 />
-                <div style="display:flex;gap:1rem;margin-top:1.5rem;">
-                    <button class="btn" style="background:#333;" onclick={move |_| on_close.emit(())}>{ "Annuler" }</button>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" onclick={move |_| on_close_btn.emit(())}>{ "Annuler" }</button>
                     <button class="btn" onclick={
                         let name = name.clone();
                         Callback::from(move |_| cb.emit((*name).clone()))
@@ -820,15 +1272,16 @@ pub struct ConfirmProps {
 
 #[function_component(ConfirmModal)]
 fn confirm_modal(props: &ConfirmProps) -> Html {
-    let on_close = props.on_close.clone();
+    let on_close_bg = props.on_close.clone();
+    let on_close_btn = props.on_close.clone();
     let on_confirm = props.on_confirm.clone();
     html! {
-        <div class="modal-overlay">
-            <div class="modal" style="width:360px;">
+        <div class="modal-overlay" onclick={move |_| on_close_bg.emit(())}>
+            <div class="modal" onclick={Callback::from(|e: MouseEvent| e.stop_propagation())}>
                 <h3>{ &props.title }</h3>
-                <p style="margin-top:1rem;color:rgba(255,255,255,0.8);">{ &props.message }</p>
-                <div style="display:flex;gap:1rem;margin-top:1.5rem;">
-                    <button class="btn" style="background:#333;" onclick={move |_| on_close.emit(())}>{ "Annuler" }</button>
+                <p class="modal-message">{ &props.message }</p>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" onclick={move |_| on_close_btn.emit(())}>{ "Annuler" }</button>
                     <button class="btn btn-danger" onclick={move |_| on_confirm.emit(())}>{ "Supprimer" }</button>
                 </div>
             </div>

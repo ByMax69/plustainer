@@ -101,6 +101,9 @@ async fn start_stack(State(state): State<AppState>, Path(id): Path<String>) -> R
     let url = format!("{}/api/stacks/{}/start?endpointId={}", state.portainer_url, id, state.endpoint_id);
     let res = state.client.post(&url).headers(get_headers(&state.api_key)).send().await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !res.status().is_success() {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
     let json = res.json::<Value>().await.unwrap_or(serde_json::json!({}));
     Ok(Json(json))
 }
@@ -109,6 +112,9 @@ async fn stop_stack(State(state): State<AppState>, Path(id): Path<String>) -> Re
     let url = format!("{}/api/stacks/{}/stop?endpointId={}", state.portainer_url, id, state.endpoint_id);
     let res = state.client.post(&url).headers(get_headers(&state.api_key)).send().await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !res.status().is_success() {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
     let json = res.json::<Value>().await.unwrap_or(serde_json::json!({}));
     Ok(Json(json))
 }
